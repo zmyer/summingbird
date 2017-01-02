@@ -18,37 +18,28 @@ package com.twitter.summingbird.storm
 
 import Constants._
 import backtype.storm.generated.StormTopology
-import backtype.storm.metric.api.IMetric
-import backtype.storm.task.TopologyContext
-import backtype.storm.spout.SpoutOutputCollector
-import backtype.storm.topology.{ BoltDeclarer, IRichBolt, IRichSpout, OutputFieldsDeclarer, TopologyBuilder }
-import backtype.storm.tuple.{ Fields, Tuple }
+import backtype.storm.topology.TopologyBuilder
+import backtype.storm.tuple.Fields
 import backtype.storm.{ LocalCluster, StormSubmitter, Config => BacktypeStormConfig }
-import com.twitter.algebird.{ Monoid, Semigroup }
 import com.twitter.bijection.{ Base64String, Injection }
 import com.twitter.chill.IKryoRegistrar
-import com.twitter.storehaus.algebra.{ Mergeable, MergeableStore, StoreAlgebra }
-import com.twitter.storehaus.{ ReadableStore, Store, WritableStore }
+import com.twitter.storehaus.algebra.{ Mergeable, MergeableStore }
+import com.twitter.storehaus.{ ReadableStore, WritableStore }
 import com.twitter.summingbird._
 import com.twitter.summingbird.batch.{ BatchID, Batcher, Timestamp }
 import com.twitter.summingbird.chill.SBChillRegistrar
 import com.twitter.summingbird.online._
-import com.twitter.summingbird.online.executor.InputState
 import com.twitter.summingbird.online.option._
 import com.twitter.summingbird.option.JobId
 import com.twitter.summingbird.planner._
-import com.twitter.summingbird.storm.StormMetric
-import com.twitter.summingbird.storm.Constants
-import com.twitter.summingbird.storm.option.{ AckOnEntry, AnchorTuples }
+import com.twitter.summingbird.storm.option.AnchorTuples
 import com.twitter.summingbird.storm.planner.StormNode
 import com.twitter.summingbird.viz.VizGraph
-import com.twitter.tormenta.spout.{ Spout, SpoutProxy }
-import com.twitter.util.{ Future, Time }
+import com.twitter.tormenta.spout.Spout
+import com.twitter.util.Future
 import org.slf4j.LoggerFactory
 import scala.collection.{ Map => CMap }
 import scala.reflect.ClassTag
-import scala.util.{ Failure, Success }
-import java.util.{ List => JList }
 
 /*
  * Batchers are used for partial aggregation. We never aggregate past two items which are not in the same batch.
@@ -186,14 +177,6 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
     type ExecutorValueType = (Timestamp, V)
     type ExecutorOutputType = (Timestamp, (K, (Option[V], V)))
 
-    val supplier: MergeableStoreFactory[ExecutorKeyType, V] = summer.store match {
-      case m: MergeableStoreFactory[ExecutorKeyType, V] => m
-      case _ => sys.error("Should never be able to get here, looking for a MergeableStoreFactory from %s".format(summer.store))
-    }
-
-    val wrappedStore: MergeableStoreFactory[ExecutorKeyType, ExecutorValueType] =
-      MergeableStoreFactoryAlgebra.wrapOnlineFactory(supplier)
-
     val anchorTuples = getOrElse(stormDag, node, AnchorTuples.default)
     val metrics = getOrElse(stormDag, node, DEFAULT_SUMMER_STORM_METRICS)
     val shouldEmit = stormDag.dependantsOf(node).size > 0
@@ -218,6 +201,8 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
     val flatmapOp: FlatMapOperation[(ExecutorKeyType, (Option[ExecutorValueType], ExecutorValueType)), ExecutorOutputType] =
       FlatMapOperation.apply(storeBaseFMOp)
 
+    val supplier: MergeableStoreFactory[ExecutorKeyType, V] = summer.store
+
     val sinkBolt = BaseBolt(
       jobID,
       metrics.metrics,
@@ -226,8 +211,10 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
       new Fields(VALUE_FIELD),
       ackOnEntry,
       maxExecutePerSec,
+      new KeyValueInjection[Int, CMap[ExecutorKeyType, ExecutorValueType]],
+      new SingleItemInjection[ExecutorOutputType],
       new executor.Summer(
-        wrappedStore,
+        () => new WrappedTSInMergeable(supplier.mergeableStore(semigroup)),
         flatmapOp,
         getOrElse(stormDag, node, DEFAULT_ONLINE_SUCCESS_HANDLER),
         getOrElse(stormDag, node, DEFAULT_ONLINE_EXCEPTION_HANDLER),
@@ -235,9 +222,7 @@ abstract class Storm(options: Map[String, Options], transformConfig: Summingbird
         getOrElse(stormDag, node, DEFAULT_MAX_WAITING_FUTURES),
         getOrElse(stormDag, node, DEFAULT_MAX_FUTURE_WAIT_TIME),
         maxEmitPerExecute,
-        getOrElse(stormDag, node, IncludeSuccessHandler.default),
-        new KeyValueInjection[Int, CMap[ExecutorKeyType, ExecutorValueType]],
-        new SingleItemInjection[ExecutorOutputType])
+        getOrElse(stormDag, node, IncludeSuccessHandler.default))
     )
 
     val parallelism = getOrElse(stormDag, node, DEFAULT_SUMMER_PARALLELISM).parHint
